@@ -3770,13 +3770,22 @@ bool Image::BindZeroBlock() {
     return true;
 }
 
+bool Image::ClearToZero() {
+    if (info.num_samples > 1 || IsRescaled() ||
+        VideoCore::Surface::DefaultBlockWidth(info.format) != 1) {
+        return false; // block-compressed images can't be cleared
+    }
+    ClearTiles();
+    return true;
+}
+
 void Image::ClearTiles() {
     scheduler->RequestOutsideRenderPassOperationContext();
     const VkImage vk_image = *original_image;
     const bool was_initialized = std::exchange(initialized, true);
-    scheduler->Record([vk_image, was_initialized](vk::CommandBuffer cmdbuf) {
-        static constexpr VkImageSubresourceRange range{
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+    scheduler->Record([vk_image, was_initialized, aspect = aspect_mask](vk::CommandBuffer cmdbuf) {
+        const VkImageSubresourceRange range{
+            .aspectMask = aspect,
             .baseMipLevel = 0,
             .levelCount = VK_REMAINING_MIP_LEVELS,
             .baseArrayLayer = 0,
@@ -3786,6 +3795,7 @@ void Image::ClearTiles() {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                              VK_ACCESS_TRANSFER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .oldLayout = was_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
@@ -3801,8 +3811,10 @@ void Image::ClearTiles() {
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                              VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                             VK_ACCESS_TRANSFER_WRITE_BIT,
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -3812,8 +3824,13 @@ void Image::ClearTiles() {
         };
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                                to_transfer);
-        cmdbuf.ClearColorImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VkClearColorValue{},
-                               range);
+        if (aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+            cmdbuf.ClearColorImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   VkClearColorValue{}, range);
+        } else {
+            cmdbuf.ClearDepthStencilImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          VkClearDepthStencilValue{}, range);
+        }
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                                to_general);
     });

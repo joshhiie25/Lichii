@@ -4,15 +4,25 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <source_location>
+#include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <algorithm>
 #include <vector>
+
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 #include <boost/container/deque.hpp>
 
@@ -166,6 +176,54 @@ inline void ReportUnmappedRead(DAddr first_unmapped, DAddr address, size_t size,
               first_unmapped, address, size, unmapped_bytes, file, caller.line());
 }
 
+// EDEN_NX2_UNTOUCHED_TRACE=1 (Linux): guest pages that had no memory until a device read or
+// write touched them, per caller, logged every 2 s. Pages in swap count too, so run it with
+// EDEN_NX2_PAGEOUT=0.
+inline void CountUntouched([[maybe_unused]] const u8* pointer, [[maybe_unused]] size_t size,
+                           [[maybe_unused]] bool write,
+                           [[maybe_unused]] const std::source_location& caller) {
+#ifdef __linux__
+    static const bool trace = std::getenv("EDEN_NX2_UNTOUCHED_TRACE") != nullptr;
+    if (!trace || size == 0) {
+        return;
+    }
+    constexpr uintptr_t page_mask = 4095;
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(pointer) + size + page_mask) & ~page_mask;
+    u64 untouched_pages = 0;
+    std::array<unsigned char, 1024> in_core;
+    for (uintptr_t at = reinterpret_cast<uintptr_t>(pointer) & ~page_mask; at < end;) {
+        const size_t length = (std::min)(static_cast<size_t>(end - at), in_core.size() * 4096);
+        if (mincore(reinterpret_cast<void*>(at), length, in_core.data()) == 0) {
+            untouched_pages += std::count_if(in_core.begin(), in_core.begin() + length / 4096,
+                                             [](unsigned char page) { return (page & 1) == 0; });
+        }
+        at += length;
+    }
+    if (untouched_pages == 0) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::map<std::tuple<std::string_view, u32, bool>, u64> pages_by_caller;
+    static auto last_report = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    std::string_view file{caller.file_name()};
+    if (const size_t slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+        file.remove_prefix(slash + 1);
+    }
+    pages_by_caller[{file, caller.line(), write}] += untouched_pages;
+    if (const auto now = std::chrono::steady_clock::now();
+        now - last_report >= std::chrono::seconds{2}) {
+        last_report = now;
+        std::string list;
+        for (const auto& [key, pages] : pages_by_caller) {
+            list += fmt::format(" {}:{} {} {} MiB;", std::get<0>(key), std::get<1>(key),
+                                std::get<2>(key) ? "write" : "read", pages >> 8);
+        }
+        LOG_INFO(HW_Memory, "Guest pages first touched by device accesses since boot:{}", list);
+    }
+#endif
+}
+
 template <typename DTraits>
 struct DeviceMemoryManagerAllocator {
     static constexpr size_t device_virtual_bits = DTraits::device_virtual_bits;
@@ -252,6 +310,18 @@ void DeviceMemoryManager<Traits>::HintCold(DAddr address, size_t size) {
                                          : std::nullopt);
         }
     });
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::IsUntouched(DAddr address, size_t size) {
+    bool untouched = size != 0;
+    WalkBlock(
+        address, size, [&](size_t, DAddr) { untouched = false; },
+        [&](size_t amount, const u8* pointer) {
+            untouched = untouched && device_memory_ptr->buffer.IsUntouched(pointer, amount);
+        },
+        [](size_t) {});
+    return untouched;
 }
 
 template <typename Traits>
@@ -525,6 +595,7 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
             std::memset(dest_pointer, 0, copy_amount);
         },
         [&](size_t copy_amount, const u8* const src_ptr) {
+            CountUntouched(src_ptr, copy_amount, false, caller);
             std::memcpy(dest_pointer, src_ptr, copy_amount);
         },
         [&](const std::size_t copy_amount) {
@@ -549,6 +620,7 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
             }
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
+            CountUntouched(dst_ptr, copy_amount, true, std::source_location::current());
             std::memcpy(dst_ptr, src_pointer, copy_amount);
         },
         [&](const std::size_t copy_amount) {
@@ -593,6 +665,7 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
             std::memset(dest_pointer, 0, copy_amount);
         },
         [&](size_t copy_amount, const u8* const src_ptr) {
+            CountUntouched(src_ptr, copy_amount, false, caller);
             std::memcpy(dest_pointer, src_ptr, copy_amount);
         },
         [&](const std::size_t copy_amount) {
@@ -618,6 +691,7 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
             }
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
+            CountUntouched(dst_ptr, copy_amount, true, std::source_location::current());
             std::memcpy(dst_ptr, src_pointer, copy_amount);
         },
         [&](const std::size_t copy_amount) {

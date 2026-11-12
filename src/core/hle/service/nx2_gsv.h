@@ -2693,7 +2693,7 @@ private:
                         vsync_state->trace_late_callbacks +=
                             VblankInterval.count() > 0 && late >= VblankInterval;
                         vsync_state->trace_max_late =
-                            (std::max)(vsync_state->trace_max_late, late.count());
+                            (std::max<s64>)(vsync_state->trace_max_late, late.count());
                         if (vsync_state->trace_last_callback) {
                             const s64 gap = observed - *vsync_state->trace_last_callback;
                             vsync_state->trace_min_gap = vsync_state->trace_min_gap
@@ -3323,6 +3323,8 @@ private:
                 m_ready->room.store(m_inputs.BelowReadyWatermark(), std::memory_order_relaxed);
             }
             std::string codec = m_codec;
+            const u32 stream_width = m_width;
+            const u32 stream_height = m_height;
             if (codec.empty() && Tegra::Host1x::IsH264Stream(input.data)) {
                 codec = "video/avc";
                 m_codec = codec;
@@ -3339,7 +3341,8 @@ private:
                                               std::min(input.data.size(), size_t{16})),
                                           " "));
                 }
-                decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
+                decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec, stream_width,
+                                                                           stream_height);
             }
             pictures.clear();
             const auto decode_start = std::chrono::steady_clock::now();

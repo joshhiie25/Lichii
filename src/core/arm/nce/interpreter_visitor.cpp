@@ -151,7 +151,8 @@ u128 InterpreterVisitor::GetVec(Vec v) {
 }
 
 u64 InterpreterVisitor::GetReg(Reg r) {
-    return m_regs[static_cast<u32>(r)];
+    // Register 31 in a data operand is XZR; m_regs only holds x0-x30 (upstream Eglantine #740).
+    return r == Reg::R31 ? 0 : m_regs[static_cast<u32>(r)];
 }
 
 u64 InterpreterVisitor::GetSp() {
@@ -167,7 +168,9 @@ void InterpreterVisitor::SetVec(Vec v, u128 value) {
 }
 
 void InterpreterVisitor::SetReg(Reg r, u64 value) {
-    m_regs[static_cast<u32>(r)] = value;
+    if (r != Reg::R31) {
+        m_regs[static_cast<u32>(r)] = value;
+    }
 }
 
 void InterpreterVisitor::SetSp(u64 value) {

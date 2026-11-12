@@ -7,6 +7,11 @@
 #include <optional>
 #include <set>
 
+#ifdef __ANDROID__
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaFormat.h>
+#endif
+
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/host1x/ffmpeg.h"
@@ -47,6 +52,245 @@ std::optional<NvdecCommon::VideoCodec> CodecFromMime(std::string_view mime) {
     }
     return std::nullopt;
 }
+
+#ifdef __ANDROID__
+/// AV1 on Android: the bundled FFmpeg has no AV1 decoder, so the SoC's MediaCodec decodes it.
+/// Output is copied into NV12 (P010 for 10-bit) AVFrames, which Render converts as for FFmpeg.
+class MediaCodecAv1 {
+public:
+    MediaCodecAv1(u32 width, u32 height) {
+        codec = AMediaCodec_createDecoderByType("video/av01");
+        if (codec == nullptr) {
+            return;
+        }
+        AMediaFormat* format = AMediaFormat_new();
+        AMediaFormat_setString(format, "mime", "video/av01");
+        AMediaFormat_setInt32(format, "width", static_cast<s32>(width ? width : 1920));
+        AMediaFormat_setInt32(format, "height", static_cast<s32>(height ? height : 1080));
+        AMediaFormat_setInt32(format, "color-format", ColorFormatYuv420SemiPlanar);
+        AMediaFormat_setInt32(format, "max-input-size", 4 << 20);
+        AMediaFormat_setInt32(format, "low-latency", 1);
+        const bool started = AMediaCodec_configure(codec, format, nullptr, nullptr, 0) == AMEDIA_OK &&
+                             AMediaCodec_start(codec) == AMEDIA_OK;
+        AMediaFormat_delete(format);
+        if (!started) {
+            AMediaCodec_delete(codec);
+            codec = nullptr;
+        }
+    }
+
+    ~MediaCodecAv1() {
+        if (codec != nullptr) {
+            AMediaCodec_stop(codec);
+            AMediaCodec_delete(codec);
+        }
+    }
+
+    bool IsOpen() const {
+        return codec != nullptr;
+    }
+
+    void Decode(std::span<const u8> data, u64 pts, std::vector<Nx2Picture>& pictures) {
+        if (Queue(data, pts, 0, pictures)) {
+            Receive(pictures, FirstOutputWaitUs);
+        }
+    }
+
+    void Drain(std::vector<Nx2Picture>& pictures) {
+        eos_seen = false;
+        if (Queue({}, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM, pictures)) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+            while (!eos_seen && std::chrono::steady_clock::now() < deadline) {
+                Receive(pictures, 20'000);
+            }
+        }
+        Reset();
+    }
+
+    void Reset() {
+        if (codec != nullptr) {
+            AMediaCodec_flush(codec);
+        }
+        eos_seen = false;
+    }
+
+private:
+    static constexpr s32 ColorFormatYuv420Planar = 19;
+    static constexpr s32 ColorFormatYuv420SemiPlanar = 21;
+    static constexpr s32 ColorFormatYuvP010 = 54;
+    static constexpr s64 FirstOutputWaitUs = 4'000;
+
+    struct OutputFormat {
+        s32 stride{};
+        s32 slice_height{};
+        s32 color_format{ColorFormatYuv420SemiPlanar};
+        s32 crop_left{};
+        s32 crop_top{};
+        s32 width{};
+        s32 height{};
+        s32 standard{};
+        s32 range{};
+    };
+
+    // Hands one input to the codec, taking pictures out while its input buffers are all busy.
+    bool Queue(std::span<const u8> data, u64 pts, u32 flags, std::vector<Nx2Picture>& pictures) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{500};
+        while (true) {
+            const ssize_t index = AMediaCodec_dequeueInputBuffer(codec, 0);
+            if (index >= 0) {
+                size_t capacity{};
+                u8* const buffer = AMediaCodec_getInputBuffer(codec, static_cast<size_t>(index),
+                                                              &capacity);
+                const size_t size = buffer != nullptr && data.size() <= capacity ? data.size() : 0;
+                if (size != data.size()) {
+                    LOG_ERROR(HW_GPU, "nx2 video: AV1 frame of {} bytes exceeds the {} byte input buffer",
+                              data.size(), capacity);
+                }
+                if (size != 0) {
+                    std::memcpy(buffer, data.data(), size);
+                }
+                return AMediaCodec_queueInputBuffer(codec, static_cast<size_t>(index), 0, size,
+                                                    pts, flags) == AMEDIA_OK;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                LOG_ERROR(HW_GPU, "nx2 video: MediaCodec took no AV1 input for 500 ms");
+                return false;
+            }
+            Receive(pictures, 10'000);
+        }
+    }
+
+    void Receive(std::vector<Nx2Picture>& pictures, s64 timeout_us) {
+        while (true) {
+            AMediaCodecBufferInfo info{};
+            const ssize_t index = AMediaCodec_dequeueOutputBuffer(codec, &info, timeout_us);
+            timeout_us = 0;
+            if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+                ReadOutputFormat();
+                continue;
+            }
+            if (index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
+                continue;
+            }
+            if (index < 0) {
+                return;
+            }
+            size_t capacity{};
+            const u8* const buffer =
+                AMediaCodec_getOutputBuffer(codec, static_cast<size_t>(index), &capacity);
+            if (buffer != nullptr && info.size > 0 && info.offset >= 0 &&
+                static_cast<size_t>(info.offset) <= capacity) {
+                if (auto picture = MakePicture(buffer + info.offset, capacity - info.offset,
+                                               info.presentationTimeUs)) {
+                    pictures.push_back(std::move(*picture));
+                }
+            }
+            eos_seen |= (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
+            AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(index), false);
+            if (eos_seen) {
+                return;
+            }
+        }
+    }
+
+    void ReadOutputFormat() {
+        AMediaFormat* format = AMediaCodec_getOutputFormat(codec);
+        const auto get = [format](const char* key, s32 fallback) {
+            s32 value{};
+            return AMediaFormat_getInt32(format, key, &value) ? value : fallback;
+        };
+        out.width = get("width", 0);
+        out.height = get("height", 0);
+        out.stride = get("stride", out.width);
+        out.slice_height = get("slice-height", out.height);
+        out.color_format = get("color-format", ColorFormatYuv420SemiPlanar);
+        out.crop_left = get("crop-left", 0);
+        out.crop_top = get("crop-top", 0);
+        // crop-right and crop-bottom are the last visible column and row
+        out.width = get("crop-right", out.width + out.crop_left - 1) - out.crop_left + 1;
+        out.height = get("crop-bottom", out.height + out.crop_top - 1) - out.crop_top + 1;
+        out.standard = get("color-standard", 0);
+        out.range = get("color-range", 0);
+        LOG_INFO(HW_GPU,
+                 "nx2 video: MediaCodec AV1 output {}x{} (stride {}, slice height {}, crop {},{}), "
+                 "color format {}",
+                 out.width, out.height, out.stride, out.slice_height, out.crop_left, out.crop_top,
+                 out.color_format);
+        AMediaFormat_delete(format);
+    }
+
+    std::optional<Nx2Picture> MakePicture(const u8* data, size_t size, s64 pts) {
+        const bool planar = out.color_format == ColorFormatYuv420Planar;
+        const bool p010 = out.color_format == ColorFormatYuvP010;
+        const s32 bytes = p010 ? 2 : 1;
+        if (out.width <= 0 || out.height <= 0 || out.stride < out.width * bytes ||
+            out.slice_height < out.height + out.crop_top ||
+            size < static_cast<size_t>(out.stride) * static_cast<size_t>(out.slice_height) * 3 / 2) {
+            LOG_ERROR(HW_GPU,
+                      "nx2 video: unusable MediaCodec AV1 output ({} bytes for {}x{}, stride {}, "
+                      "slice height {})",
+                      size, out.width, out.height, out.stride, out.slice_height);
+            return std::nullopt;
+        }
+        auto frame = std::make_shared<FFmpeg::Frame>();
+        AVFrame* const f = frame->GetFrame();
+        f->format = planar ? AV_PIX_FMT_YUV420P : p010 ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+        f->width = out.width;
+        f->height = out.height;
+        if (av_frame_get_buffer(f, 0) < 0) {
+            return std::nullopt;
+        }
+        const size_t stride = static_cast<size_t>(out.stride);
+        const u8* const luma = data + stride * static_cast<size_t>(out.crop_top) +
+                               static_cast<size_t>(out.crop_left * bytes);
+        for (s32 y = 0; y < out.height; ++y) {
+            std::memcpy(f->data[0] + y * f->linesize[0], luma + stride * static_cast<size_t>(y),
+                        static_cast<size_t>(out.width * bytes));
+        }
+        const s32 chroma_rows = (out.height + 1) / 2;
+        const u8* const chroma_base = data + stride * static_cast<size_t>(out.slice_height);
+        if (planar) {
+            // U then V, each half the stride wide and half the slice height tall
+            const size_t chroma_stride = stride / 2;
+            const size_t plane_size = chroma_stride * static_cast<size_t>(out.slice_height / 2);
+            for (s32 p = 1; p <= 2; ++p) {
+                const u8* const plane = chroma_base + plane_size * static_cast<size_t>(p - 1) +
+                                        chroma_stride * static_cast<size_t>(out.crop_top / 2) +
+                                        static_cast<size_t>(out.crop_left / 2);
+                for (s32 y = 0; y < chroma_rows; ++y) {
+                    std::memcpy(f->data[p] + y * f->linesize[p],
+                                plane + chroma_stride * static_cast<size_t>(y),
+                                static_cast<size_t>((out.width + 1) / 2));
+                }
+            }
+        } else {
+            const u8* const plane = chroma_base + stride * static_cast<size_t>(out.crop_top / 2) +
+                                    static_cast<size_t>((out.crop_left & ~1) * bytes);
+            for (s32 y = 0; y < chroma_rows; ++y) {
+                std::memcpy(f->data[1] + y * f->linesize[1],
+                            plane + stride * static_cast<size_t>(y),
+                            static_cast<size_t>(((out.width + 1) / 2) * 2 * bytes));
+            }
+        }
+        f->pts = pts;
+        f->best_effort_timestamp = pts;
+        // MediaFormat.COLOR_STANDARD_* and COLOR_RANGE_*; unset stays unspecified
+        f->colorspace = out.standard == 1   ? AVCOL_SPC_BT709
+                        : out.standard == 6 ? AVCOL_SPC_BT2020_NCL
+                        : out.standard == 2 || out.standard == 4 ? AVCOL_SPC_SMPTE170M
+                                                                 : AVCOL_SPC_UNSPECIFIED;
+        f->color_range = out.range == 1   ? AVCOL_RANGE_JPEG
+                         : out.range == 2 ? AVCOL_RANGE_MPEG
+                                          : AVCOL_RANGE_UNSPECIFIED;
+        return Nx2Picture{static_cast<u32>(out.width), static_cast<u32>(out.height),
+                          static_cast<u64>(pts), std::move(frame)};
+    }
+
+    AMediaCodec* codec{};
+    OutputFormat out;
+    bool eos_seen{};
+};
+#endif
 
 } // namespace
 
@@ -94,6 +338,9 @@ struct Nx2VideoDecoder::Impl {
     std::optional<FFmpeg::Decoder> decoder;
     std::optional<FFmpeg::HardwareContext> hardware;
     std::optional<FFmpeg::DecoderContext> context;
+#ifdef __ANDROID__
+    std::optional<MediaCodecAv1> mediacodec;
+#endif
     SwsContext* scaler{};
     bool open{};
     H264PacketConverter h264_packets;
@@ -129,7 +376,9 @@ struct Nx2VideoDecoder::Impl {
     }
 };
 
-Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<Impl>()} {
+Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime, [[maybe_unused]] u32 width,
+                                 [[maybe_unused]] u32 height)
+    : impl{std::make_unique<Impl>()} {
     impl->name = std::string{mime};
     const auto start = std::chrono::steady_clock::now();
     const auto codec = CodecFromMime(mime);
@@ -139,6 +388,19 @@ Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<
     }
     impl->decoder.emplace(*codec);
     if (impl->decoder->GetCodec() == nullptr) {
+#ifdef __ANDROID__
+        if (*codec == NvdecCommon::VideoCodec::AV1) {
+            impl->mediacodec.emplace(width, height);
+            impl->open = impl->mediacodec->IsOpen();
+            if (impl->open) {
+                LOG_INFO(HW_GPU, "nx2 video: \"{}\" decodes on the GPU with MediaCodec", mime);
+            } else {
+                LOG_ERROR(HW_GPU, "nx2 video: MediaCodec cannot open an AV1 decoder for \"{}\"",
+                          mime);
+            }
+            return;
+        }
+#endif
         LOG_ERROR(HW_GPU, "nx2 video: FFmpeg has no decoder for \"{}\"", mime);
         return;
     }
@@ -184,6 +446,12 @@ void Nx2VideoDecoder::Decode(std::span<const u8> data, u64 pts, std::vector<Nx2P
     if (!impl->open || data.empty()) {
         return;
     }
+#ifdef __ANDROID__
+    if (impl->mediacodec) {
+        impl->mediacodec->Decode(data, pts, pictures);
+        return;
+    }
+#endif
     impl->packet.assign(data.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
     std::memcpy(impl->packet.data(), data.data(), data.size());
 
@@ -207,12 +475,24 @@ void Nx2VideoDecoder::Drain(std::vector<Nx2Picture>& pictures) {
     if (!impl->open) {
         return;
     }
+#ifdef __ANDROID__
+    if (impl->mediacodec) {
+        impl->mediacodec->Drain(pictures);
+        return;
+    }
+#endif
     avcodec_send_packet(impl->context->GetCodecContext(), nullptr);
     impl->Receive(pictures);
     Reset();
 }
 
 void Nx2VideoDecoder::Reset() {
+#ifdef __ANDROID__
+    if (impl->mediacodec) {
+        impl->mediacodec->Reset();
+        return;
+    }
+#endif
     if (impl->open) {
         avcodec_flush_buffers(impl->context->GetCodecContext());
     }

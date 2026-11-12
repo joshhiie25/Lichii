@@ -59,6 +59,10 @@ public:
     /// from a low-priority thread: data the host GPU has its own copy of, e.g. uploaded textures.
     void HintCold(DAddr address, size_t size);
 
+    /// Whether [address, address + size) is mapped to memory nothing ever wrote
+    /// (Common::HostMemory::IsUntouched): it reads as zeros.
+    [[nodiscard]] bool IsUntouched(DAddr address, size_t size);
+
     DAddr Allocate(size_t size);
     void AllocateFixed(DAddr start, size_t size);
     void Free(DAddr start, size_t size);

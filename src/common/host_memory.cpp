@@ -55,10 +55,21 @@
 #endif // ^^^ POSIX ^^^
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <thread>
+#include <vector>
+
+#if defined(__ANDROID__) && !defined(MADV_PAGEOUT)
+#define MADV_PAGEOUT 21
+#endif
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <random>
+#include <string>
 #include <utility>
 
 #include "common/alignment.h"
@@ -589,6 +600,15 @@ public:
                fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
                          static_cast<off_t>(length)) == 0;
     }
+
+    /// No page of the range was ever given memory. Pages in swap have data.
+    bool IsHole(size_t offset, size_t length) {
+        if (fd < 0) {
+            return false;
+        }
+        const off_t data = lseek(fd, static_cast<off_t>(offset), SEEK_DATA);
+        return data < 0 ? errno == ENXIO : static_cast<size_t>(data) >= offset + length;
+    }
 #endif
 
     bool Init() {
@@ -697,12 +717,183 @@ public:
             LOG_INFO(Common_Memory, "Fastmem maps {:#x} byte host pages whose guest pages are contiguous",
                      host_page_size);
         }
+#ifdef __ANDROID__
+        if (fd >= 0) {
+            pageout_thread = std::thread([this] { PageoutLoop(); });
+        }
+#endif
         return true;
     }
 
     ~Impl() {
+#ifdef __ANDROID__
+        pageout_stop = true;
+        if (pageout_thread.joinable()) {
+            pageout_thread.join();
+        }
+#endif
         Release();
     }
+
+#ifdef __ANDROID__
+    // Guest memory is the biggest anonymous consumer next to the GPU, and lmkd kills the game on
+    // memory pressure before zram swap helps. While MemFree is low, push cold guest pages of the
+    // memfd views (not the unmapped-in-practice backing view) to swap, 64 MiB per 100 ms.
+    static u64 ReadMemFreeKiB() {
+        FILE* const f = std::fopen("/proc/meminfo", "r");
+        if (!f) {
+            return ~u64{};
+        }
+        char line[128];
+        u64 free_kib = ~u64{};
+        while (std::fgets(line, sizeof(line), f)) {
+            if (std::sscanf(line, "MemFree: %llu kB", reinterpret_cast<unsigned long long*>(&free_kib)) == 1) {
+                break;
+            }
+        }
+        std::fclose(f);
+        return free_kib;
+    }
+
+    // EDEN_NX2_GUEST_RESIDENT=1: every 2 s, guest memory in RAM and in swap from /proc/self/smaps.
+    // The backing view holds the pages the GPU caches touched; the other views hold those the
+    // guest's code and the services touched, listed per GiB of guest address. Pages in RAM that
+    // the guest's views don't map were touched through the backing view only.
+    void LogGuestResidency() {
+        FILE* const smaps = std::fopen("/proc/self/smaps", "r");
+        if (!smaps) {
+            return;
+        }
+        struct Use {
+            u64 rss_kib{};     ///< Mapped by this view: touched through it
+            u64 swap_kib{};
+            u64 in_core_kib{}; ///< In RAM, touched through any view
+        };
+        Use backing;
+        Use views;
+        std::map<u64, Use> per_gib;
+        std::vector<unsigned char> in_core;
+        Use* total = nullptr;
+        Use* bucket = nullptr;
+        char line[512];
+        while (std::fgets(line, sizeof(line), smaps)) {
+            unsigned long long begin{}, end{}, value{};
+            if (std::sscanf(line, "%llx-%llx", &begin, &end) == 2) {
+                total = bucket = nullptr;
+                if (!std::strstr(line, "memfd:HostMemory")) {
+                    continue;
+                }
+                if (begin == reinterpret_cast<uintptr_t>(backing_base)) {
+                    total = &backing;
+                } else {
+                    total = &views;
+                    bucket = &per_gib[(begin - reinterpret_cast<uintptr_t>(virtual_base)) >> 30];
+                    // Pages of the file in RAM behind this view, whoever touched them.
+                    constexpr size_t chunk = 256ULL << 20;
+                    in_core.resize(chunk / 4096);
+                    for (unsigned long long at = begin; at < end; at += chunk) {
+                        const size_t len = (std::min)(static_cast<size_t>(end - at), chunk);
+                        if (mincore(reinterpret_cast<void*>(at), len, in_core.data()) != 0) {
+                            continue;
+                        }
+                        const u64 pages = static_cast<u64>(
+                            std::count_if(in_core.begin(), in_core.begin() + (len + 4095) / 4096,
+                                          [](unsigned char page) { return (page & 1) != 0; }));
+                        views.in_core_kib += pages * 4;
+                        bucket->in_core_kib += pages * 4;
+                    }
+                }
+            } else if (total != nullptr) {
+                if (std::sscanf(line, "Rss: %llu kB", &value) == 1) {
+                    total->rss_kib += value;
+                    if (bucket) {
+                        bucket->rss_kib += value;
+                    }
+                } else if (std::sscanf(line, "Swap: %llu kB", &value) == 1) {
+                    total->swap_kib += value;
+                    if (bucket) {
+                        bucket->swap_kib += value;
+                    }
+                }
+            }
+        }
+        std::fclose(smaps);
+        std::string list;
+        for (const auto& [gib, use] : per_gib) {
+            if (use.rss_kib + use.swap_kib >= 16 * 1024) {
+                list += fmt::format(" {:#x}:{}/{}/{}", gib << 30, use.rss_kib >> 10,
+                                    use.in_core_kib >> 10, use.swap_kib >> 10);
+            }
+        }
+        LOG_INFO(Common_Memory,
+                 "Guest residency: backing view {} MiB in RAM, {} MiB in swap; guest views {} MiB "
+                 "touched by the guest, {} MiB in RAM, {} MiB in swap; per GiB of guest address "
+                 "(guest-touched/RAM/swap MiB):{}",
+                 backing.rss_kib >> 10, backing.swap_kib >> 10, views.rss_kib >> 10,
+                 views.in_core_kib >> 10, views.swap_kib >> 10, list);
+    }
+
+    void PageoutLoop() {
+        constexpr u64 low_free_kib = 1536ULL * 1024;
+        constexpr size_t step = 64ULL << 20;
+        // EDEN_NX2_PAGEOUT=0 leaves guest pages alone, for A/B runs.
+        static const bool pageout = [] {
+            const char* value = std::getenv("EDEN_NX2_PAGEOUT");
+            return value == nullptr || value[0] != '0';
+        }();
+        static const bool resident_trace = std::getenv("EDEN_NX2_GUEST_RESIDENT") != nullptr;
+        size_t cursor = 0;
+        u32 ticks = 0;
+        while (!pageout_stop) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (resident_trace && ++ticks % 20 == 0) {
+                LogGuestResidency();
+            }
+            if (!pageout || ReadMemFreeKiB() >= low_free_kib) {
+                continue;
+            }
+            // Re-read the maps each round: guest mappings come and go.
+            std::vector<std::pair<uintptr_t, size_t>> ranges;
+            if (FILE* const maps = std::fopen("/proc/self/maps", "r")) {
+                char line[512];
+                while (std::fgets(line, sizeof(line), maps)) {
+                    unsigned long long begin{}, end{};
+                    if (!std::strstr(line, "memfd:HostMemory") ||
+                        std::sscanf(line, "%llx-%llx", &begin, &end) != 2 ||
+                        begin == reinterpret_cast<uintptr_t>(backing_base)) {
+                        continue;
+                    }
+                    ranges.emplace_back(begin, end - begin);
+                }
+                std::fclose(maps);
+            }
+            size_t total = 0;
+            for (const auto& r : ranges) {
+                total += r.second;
+            }
+            if (total == 0) {
+                continue;
+            }
+            cursor %= total;
+            size_t budget = step;
+            size_t skip = cursor;
+            for (const auto& [begin, size] : ranges) {
+                if (skip >= size) {
+                    skip -= size;
+                    continue;
+                }
+                const size_t len = std::min(size - skip, budget);
+                madvise(reinterpret_cast<void*>(begin + skip), len, MADV_PAGEOUT);
+                budget -= len;
+                cursor += len;
+                skip = 0;
+                if (budget == 0) {
+                    break;
+                }
+            }
+        }
+    }
+#endif
 
     void* Allocate(size_t size) {
         if (allocation_test_control) {
@@ -969,6 +1160,10 @@ private:
     }
 
     int fd{-1}; // memfd file descriptor, -1 is the error value of memfd_create
+#ifdef __ANDROID__
+    std::thread pageout_thread;
+    std::atomic<bool> pageout_stop{false};
+#endif
     FreeRegionManager free_manager{};
     size_t host_page_size{PageAlignment};
     u32* page_states{};
@@ -1120,6 +1315,7 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
 
 namespace {
 std::atomic<u64> g_zero_filled_bytes{};
+std::atomic<u64> g_released_bytes{};
 
 [[maybe_unused]] bool IsZeroPage(const u8* page) {
     const auto* words = reinterpret_cast<const u64*>(page);
@@ -1260,6 +1456,37 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
         }
         offset = clear_end;
     }
+}
+
+bool HostMemory::IsUntouched([[maybe_unused]] const u8* backing_pointer,
+                             [[maybe_unused]] size_t length) const {
+#ifdef __linux__
+    if (impl && backing_pointer >= backing_base &&
+        backing_pointer + length <= backing_base + backing_size) {
+        return impl->IsHole(static_cast<size_t>(backing_pointer - backing_base), length);
+    }
+#endif
+    return false;
+}
+
+void HostMemory::ReleaseBackingRegion([[maybe_unused]] size_t physical_offset,
+                                      [[maybe_unused]] size_t length) {
+#ifdef __ANDROID__
+    constexpr size_t granule_size = size_t{1} << GranuleShift;
+    const size_t first = (physical_offset + granule_size - 1) >> GranuleShift;
+    const size_t last = (physical_offset + length) >> GranuleShift; // exclusive
+    for (size_t index = first; index < last && index < num_granules; ++index) {
+        if ((granules[index].load(std::memory_order_acquire) & GranuleDirty) != 0 && impl &&
+            impl->PunchHole(index << GranuleShift, granule_size)) {
+            granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
+            const u64 total = g_released_bytes.fetch_add(granule_size, std::memory_order_relaxed);
+            if ((total >> 28) != ((total + granule_size) >> 28)) {
+                LOG_INFO(HW_Memory, "Guest memory freed back to the OS: {} MiB so far",
+                         (total + granule_size) >> 20);
+            }
+        }
+    }
+#endif
 }
 
 void HostMemory::MarkUsed(size_t physical_offset, size_t length) {

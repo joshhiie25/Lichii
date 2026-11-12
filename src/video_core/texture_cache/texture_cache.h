@@ -350,6 +350,17 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
             *target = (std::min)(static_cast<u64>(std::strtoull(value, nullptr, 10)) << 20, limit);
         }
     }
+#ifdef __ANDROID__
+    // The GPU shares RAM with the guest (5+ GB for a Switch 2 title): lmkd kills the game once a
+    // load burst fills it (Ocarina's first gameplay scene, 8 of 10 runs), and the device-local
+    // size says nothing about what is left. Without the env overrides, keep the cache small.
+    if (!std::getenv("EDEN_NX2_TC_CRITICAL_MIB")) {
+        critical_memory = (std::min)(critical_memory, u64{1024_MiB});
+    }
+    if (!std::getenv("EDEN_NX2_TC_EXPECTED_MIB")) {
+        expected_memory = (std::min)(expected_memory, u64{768_MiB});
+    }
+#endif
     expected_memory = (std::min)(expected_memory, critical_memory);
     if (log) {
         LogThresholds();
@@ -580,10 +591,13 @@ void TextureCache<P>::TickFrame() {
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         LOG_INFO(HW_GPU,
                  "Texture cache last 600 frames: stale uploads skipped {} ({} MiB), {} uploaded "
-                 "for buffer-written pages; {} MiB of pages marked stale",
+                 "for buffer-written pages; {} MiB of pages marked stale; {} images zeroed over "
+                 "unwritten guest memory ({} MiB)",
                  tc_stale_skips, tc_stale_skip_bytes >> 20, tc_stale_gpu_written,
-                 (stale_pages.Count() << StalePages::PAGE_BITS) >> 20);
+                 (stale_pages.Count() << StalePages::PAGE_BITS) >> 20, tc_untouched_clears,
+                 tc_untouched_clear_bytes >> 20);
         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
+        tc_untouched_clears = tc_untouched_clear_bytes = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
@@ -2191,6 +2205,21 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         LOG_WARNING(HW_GPU, "MSAA image uploads are not implemented");
         runtime.TransitionImageLayout(image);
         return;
+    }
+    // Guest memory nothing has written yet reads as zeros, and reading it makes the host give it
+    // RAM (Ocarina of Time makes ~480 MiB of render targets over such memory in one frame, a
+    // 288 MiB shadow map among them): zero the image instead of uploading it.
+    if constexpr (requires { image.ClearToZero(); }) {
+        constexpr u64 UntouchedMinBytes = 1_MiB;
+        if (image.guest_size_bytes >= UntouchedMinBytes &&
+            False(image.flags & ImageFlagBits::Sparse) &&
+            VideoCore::Surface::DefaultBlockWidth(image.info.format) == 1 &&
+            device_memory.IsUntouched(image.cpu_addr, image.guest_size_bytes) &&
+            image.ClearToZero()) {
+            ++tc_untouched_clears;
+            tc_untouched_clear_bytes += image.guest_size_bytes;
+            return;
+        }
     }
     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
         QueueAsyncDecode(image, image_id);

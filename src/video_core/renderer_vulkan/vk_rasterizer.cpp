@@ -2769,7 +2769,10 @@ void RasterizerVulkan::WaitForIdle() {
 
     query_cache.NotifyWFI();
 
-    if (device.IsMoltenVK() && scheduler.IsRenderPassActive()) {
+    // Without storage stores in the pass there is nothing but attachment writes to order, and
+    // the pass end already barriers those; the next draw still breaks if it samples them.
+    if ((device.IsMoltenVK() || !scheduler.RenderPassHasStores()) &&
+        scheduler.IsRenderPassActive()) {
         scheduler.DeferFragmentBarrier();
         fence_manager.SignalOrdering();
         return;

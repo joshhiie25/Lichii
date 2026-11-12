@@ -658,6 +658,8 @@ private:
     u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
     u64 tc_stale_skip_bytes{};
     u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
+    u64 tc_untouched_clears{};   ///< Images zeroed instead of uploaded from unwritten memory
+    u64 tc_untouched_clear_bytes{};
 
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;

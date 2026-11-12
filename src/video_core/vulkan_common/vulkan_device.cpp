@@ -8,7 +8,12 @@
 #include <array>
 #include <bitset>
 #include <chrono>
+#include <atomic>
 #include <cstdlib>
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#include <unwind.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -440,7 +445,43 @@ VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device,
                                                    VkDeviceMemory* memory) {
     using namespace VideoCommon::StutterTrace;
     const SiteScope site{Site::MemoryAllocate};
-    return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    // EDEN_NX2_ALLOC_TRACE=1: one line per device memory block of 16 MiB or more.
+    static const bool trace = std::getenv("EDEN_NX2_ALLOC_TRACE") != nullptr;
+    static std::atomic<u64> total{0};
+    const VkResult result = g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    if (trace && allocate_info->allocationSize >= (16ULL << 20)) {
+        const u64 sum = result == VK_SUCCESS ? total += allocate_info->allocationSize : total.load();
+        std::string stack;
+#ifdef __ANDROID__
+        if (allocate_info->allocationSize >= (48ULL << 20)) {
+            struct State {
+                uintptr_t frames[14];
+                int count;
+            } state{};
+            _Unwind_Backtrace(
+                [](_Unwind_Context* context, void* arg) {
+                    auto& s = *static_cast<State*>(arg);
+                    if (s.count >= 14) {
+                        return _URC_END_OF_STACK;
+                    }
+                    s.frames[s.count++] = _Unwind_GetIP(context);
+                    return _URC_NO_REASON;
+                },
+                &state);
+            for (int i = 2; i < state.count; ++i) {
+                Dl_info info{};
+                if (dladdr(reinterpret_cast<void*>(state.frames[i]), &info) != 0) {
+                    stack += fmt::format(" {:x}", state.frames[i] -
+                                                      reinterpret_cast<uintptr_t>(info.dli_fbase));
+                }
+            }
+        }
+#endif
+        LOG_INFO(Render_Vulkan, "AllocTrace {} MiB type {} result {} total {} MiB{}",
+                 allocate_info->allocationSize >> 20, allocate_info->memoryTypeIndex,
+                 static_cast<int>(result), sum >> 20, stack);
+    }
+    return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL TimedFreeMemory(VkDevice device, VkDeviceMemory memory,

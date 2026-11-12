@@ -189,8 +189,16 @@ void BufferCache<P>::TickFrame() {
         // downloading the GPU-written ones, ~5% of the GPU thread) that were recreated later.
         // Collect when the buffers themselves are large. At 1 GiB it held geometry of scenes
         // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
-        if (buffer_bytes >= 512_MiB) {
-            RunGarbageCollector(buffer_bytes >= 1_GiB);
+#ifdef __ANDROID__
+        // Shared RAM (see TextureCache::ApplyThresholdOverrides): collect buffers early.
+        constexpr u64 gc_start = 256_MiB;
+        constexpr u64 gc_aggressive = 512_MiB;
+#else
+        constexpr u64 gc_start = 512_MiB;
+        constexpr u64 gc_aggressive = 1_GiB;
+#endif
+        if (buffer_bytes >= gc_start) {
+            RunGarbageCollector(buffer_bytes >= gc_aggressive);
         }
     } else if (total_used_memory >= minimum_memory) {
         RunGarbageCollector(total_used_memory >= critical_memory);

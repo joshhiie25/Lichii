@@ -16,6 +16,11 @@
 #include "core/hle/kernel/k_typed_address.h"
 #include "core/hle/result.h"
 
+namespace Kernel {
+/// Gives the host RAM of pages the guest freed back to the OS, before they can be handed out again.
+void ReleaseFreedPages(KPhysicalAddress addr, size_t num_pages);
+} // namespace Kernel
+
 namespace Core {
 class System;
 }
@@ -215,6 +220,7 @@ private:
             return m_heap.AllocateAligned(index, num_pages, align_pages);
         }
         void Free(KPhysicalAddress addr, size_t num_pages) {
+            ReleaseFreedPages(addr, num_pages);
             m_heap.Free(addr, num_pages);
         }
 

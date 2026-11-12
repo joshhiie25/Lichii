@@ -18,6 +18,9 @@
 #include <dxgi1_4.h>
 #endif
 
+#include <cstdio>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <string>
@@ -289,6 +292,18 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         pressure_events.fetch_add(1, std::memory_order_relaxed);
+    }
+    static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+    static std::atomic<u32> big_logged{};
+    if (mem_trace && result == VK_SUCCESS && alloc_info.size >= (48ULL << 20) &&
+        big_logged.fetch_add(1) < 200) {
+        LOG_INFO(Render_Vulkan,
+                 "Memory trace: big image {} MiB: type {} {}x{}x{}, {} levels, {} layers, format "
+                 "{}, usage {:#x}, samples {}",
+                 alloc_info.size >> 20, static_cast<u32>(ci.imageType), ci.extent.width,
+                 ci.extent.height, ci.extent.depth, ci.mipLevels, ci.arrayLayers,
+                 static_cast<u32>(ci.format), static_cast<u32>(ci.usage),
+                 static_cast<u32>(ci.samples));
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D &&
         UsesUnbackedFallback(texels, bytes, may_fail)) {
@@ -720,6 +735,21 @@ void LogMemoryTrace(const Device& device) {
                        budget.statistics.blockBytes >> 20);
     }
     LOG_INFO(Render_Vulkan, "Memory trace: heaps {}", heaps);
+    // EDEN_NX2_VMA_DUMP=<file>: detailed VMA dump (every allocation with type and size) to
+    // <file>.<n> each time the first heap grows 256 MiB past the last dump, from 768 MiB.
+    static const char* const dump_path = std::getenv("EDEN_NX2_VMA_DUMP");
+    static u64 dump_threshold = u64{3} << 28;
+    static u32 dump_index = 0;
+    if (dump_path != nullptr && budgets[0].statistics.allocationBytes > dump_threshold) {
+        dump_threshold = budgets[0].statistics.allocationBytes + (u64{1} << 28);
+        char* json{};
+        vmaBuildStatsString(allocator, &json, VK_TRUE);
+        if (std::FILE* file = std::fopen(fmt::format("{}.{}", dump_path, dump_index++).c_str(), "wb")) {
+            std::fwrite(json, 1, std::strlen(json), file);
+            std::fclose(file);
+        }
+        vmaFreeStatsString(allocator, json);
+    }
     VmaTotalStatistics stats{};
     vmaCalculateStatistics(allocator, &stats);
     std::string types;

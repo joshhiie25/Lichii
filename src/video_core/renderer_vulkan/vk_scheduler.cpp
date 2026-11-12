@@ -14,9 +14,15 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 #include <fmt/format.h>
+
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#include <unwind.h>
+#endif
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
@@ -47,6 +53,39 @@ std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
+
+// Which callers wait in Finish: call stacks as module offsets (symbolize with llvm-symbolizer).
+std::mutex g_profile_finish_mutex;
+std::map<std::string, std::pair<u64, u64>> g_profile_finish_sites;
+
+std::string CaptureFinishSite() {
+#ifdef __ANDROID__
+    struct State {
+        uintptr_t frames[10];
+        int count;
+    } state{};
+    _Unwind_Backtrace(
+        [](_Unwind_Context* context, void* arg) {
+            auto& s = *static_cast<State*>(arg);
+            if (s.count >= 10) {
+                return _URC_END_OF_STACK;
+            }
+            s.frames[s.count++] = _Unwind_GetIP(context);
+            return _URC_NO_REASON;
+        },
+        &state);
+    std::string key;
+    for (int i = 2; i < state.count; ++i) {
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(state.frames[i]), &info) && info.dli_fbase) {
+            key += fmt::format("{:x} ", state.frames[i] - reinterpret_cast<uintptr_t>(info.dli_fbase));
+        }
+    }
+    return key;
+#else
+    return {};
+#endif
+}
 
 void CountRenderPassEnd(const char* file, u32 line) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
@@ -92,6 +131,20 @@ void ReportSubmitCounts() {
     for (size_t i = 0; i < ends.size() && i < 16; ++i) {
         LOG_INFO(Render_Vulkan, "Render pass ends {:.0f}/s at {}",
                  static_cast<double>(ends[i].first) / seconds, ends[i].second);
+    }
+    std::vector<std::tuple<u64, u64, std::string>> sites;
+    {
+        std::scoped_lock lock{g_profile_finish_mutex};
+        for (const auto& [site, value] : g_profile_finish_sites) {
+            sites.emplace_back(value.second, value.first, site);
+        }
+        g_profile_finish_sites.clear();
+    }
+    std::sort(sites.rbegin(), sites.rend());
+    for (size_t i = 0; i < sites.size() && i < 12; ++i) {
+        LOG_INFO(Render_Vulkan, "Finish site {:.0f}/s waiting {:.1f} ms/s: {}",
+                 static_cast<double>(std::get<1>(sites[i])) / seconds,
+                 static_cast<double>(std::get<0>(sites[i])) / 1e6 / seconds, std::get<2>(sites[i]));
     }
 }
 }
@@ -261,6 +314,10 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     const VideoCommon::StutterTrace::SiteScope site{VideoCommon::StutterTrace::Site::SchedulerFinish};
     const u64 presubmit_tick = CurrentTick();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
+    std::string site_key;
+    if (profile) {
+        site_key = CaptureFinishSite();
+    }
     const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
     SubmitExecution(signal_semaphore, wait_semaphore);
     Wait(presubmit_tick);
@@ -269,9 +326,13 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     if (profile) {
+        const u64 waited = VideoCommon::Nx2Profile::Now() - start;
         g_profile_finishes.fetch_add(1, std::memory_order_relaxed);
-        g_profile_finish_ns.fetch_add(VideoCommon::Nx2Profile::Now() - start,
-                                      std::memory_order_relaxed);
+        g_profile_finish_ns.fetch_add(waited, std::memory_order_relaxed);
+        std::scoped_lock lock{g_profile_finish_mutex};
+        auto& site = g_profile_finish_sites[site_key];
+        ++site.first;
+        site.second += waited;
     }
 }
 

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <random>
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -920,6 +921,19 @@ Result KProcess::Run(KernelCore& kernel, s32 priority, size_t stack_size) {
     // Validate that we're in a state where we can initialize.
     const auto state = m_state;
     R_UNLESS(state == State::Created || state == State::CreatedAttached, ResultInvalidState);
+
+    // Names the address ranges of the "Guest residency" lines (EDEN_NX2_GUEST_RESIDENT).
+    if (std::getenv("EDEN_NX2_GUEST_RESIDENT") != nullptr) {
+        LOG_INFO(Kernel,
+                 "Guest regions: code {:#x}+{:#x}, alias {:#x}+{:#x}, heap {:#x}+{:#x}, stack "
+                 "{:#x}+{:#x}, alias code {:#x}+{:#x}",
+                 GetInteger(m_page_table.GetCodeRegionStart()), m_page_table.GetCodeRegionSize(),
+                 GetInteger(m_page_table.GetAliasRegionStart()), m_page_table.GetAliasRegionSize(),
+                 GetInteger(m_page_table.GetHeapRegionStart()), m_page_table.GetHeapRegionSize(),
+                 GetInteger(m_page_table.GetStackRegionStart()), m_page_table.GetStackRegionSize(),
+                 GetInteger(m_page_table.GetAliasCodeRegionStart()),
+                 m_page_table.GetAliasCodeRegionSize());
+    }
 
     // Place a tentative reservation of a thread for this process.
     KScopedResourceReservation thread_reservation(kernel, this, Svc::LimitableResource::ThreadCountMax);

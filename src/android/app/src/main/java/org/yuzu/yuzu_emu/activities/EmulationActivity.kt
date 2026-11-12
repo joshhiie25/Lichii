@@ -40,6 +40,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -128,6 +129,7 @@ class EmulationActivity : AppCompatActivity(), SensorEventListener, InputManager
         NativeConfig.reloadGlobalConfig()
 
         InputHandler.updateControllerData()
+        registerDebugButtonReceiver()
         val players = NativeConfig.getInputSettings(true)
         var hasConfiguredControllers = false
         players.forEach {
@@ -259,8 +261,33 @@ class EmulationActivity : AppCompatActivity(), SensorEventListener, InputManager
         super.onPause()
     }
 
+    private var debugButtonReceiver: BroadcastReceiver? = null
+
+    // EDEN_NX2_DEBUG_INPUT=1 (nx2_env.txt): `adb shell am broadcast -a dev.eden.debug.BUTTON
+    // --ei key <KeyEvent code>` presses and releases that button on the first controller.
+    private fun registerDebugButtonReceiver() {
+        if (System.getenv("EDEN_NX2_DEBUG_INPUT") == null) {
+            return
+        }
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                val key = intent.getIntExtra("key", KeyEvent.KEYCODE_BUTTON_A)
+                val data = InputHandler.androidControllers.values.firstOrNull() ?: return
+                for (state in intArrayOf(NativeInput.ButtonState.PRESSED, NativeInput.ButtonState.RELEASED)) {
+                    NativeInput.onGamePadButtonEvent(data.getGUID(), data.getPort(), key, state)
+                    Thread.sleep(120)
+                }
+            }
+        }
+        debugButtonReceiver = receiver
+        ContextCompat.registerReceiver(
+            this, receiver, IntentFilter("dev.eden.debug.BUTTON"), ContextCompat.RECEIVER_EXPORTED
+        )
+    }
+
     override fun onDestroy() {
         mainHandler.removeCallbacks(romSwapStopTimeoutRunnable)
+        debugButtonReceiver?.let { unregisterReceiver(it) }
         super.onDestroy()
         inputManager.unregisterInputDeviceListener(this)
         stopForegroundService(this)

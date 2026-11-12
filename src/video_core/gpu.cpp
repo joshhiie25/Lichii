@@ -329,7 +329,14 @@ struct GPU::Impl {
             VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
             if (!rasterizer->TryCacheInvalidation(addr, size)) {
                 const u64 fence = RequestSyncOperation([rasterizer, addr, size] {
-                    rasterizer->FlushRegion(addr, size, VideoCommon::CacheType::BufferCache);
+                    // Every flush waits for the host GPU, and a guest writes scattered pages of the
+                    // same GPU-written buffers many times a frame (Ocarina: ~160 waits a frame):
+                    // flush the whole 4 MiB window so its neighbours don't wait again.
+                    constexpr u64 window = u64{4} << 20;
+                    const DAddr window_begin = addr & ~(window - 1);
+                    const DAddr window_end = (addr + size + window - 1) & ~(window - 1);
+                    rasterizer->FlushRegion(window_begin, window_end - window_begin,
+                                            VideoCommon::CacheType::BufferCache);
                     rasterizer->OnCacheInvalidation(addr, size);
                 });
                 gpu_thread.TickGPU(is_async);

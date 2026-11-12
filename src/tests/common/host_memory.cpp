@@ -263,6 +263,18 @@ TEST_CASE("HostMemory: Partial sparse middle unmap and check bindings", "[common
     REQUIRE(ptr[0x3fff] == 12);
 }
 
+#ifdef __linux__
+TEST_CASE("HostMemory: Untouched backing memory", "[common]") {
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    u8* const backing = mem.BackingBasePointer();
+    REQUIRE(mem.IsUntouched(backing + 0x100000, 0x100000));
+    backing[0x180000] = 1;
+    REQUIRE(!mem.IsUntouched(backing + 0x100000, 0x100000));
+    REQUIRE(mem.IsUntouched(backing + 0x100000, 0x40000));
+    REQUIRE(mem.IsUntouched(backing + 0x200000, 0x100000));
+}
+#endif
+
 #ifdef _WIN32
 TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
     constexpr size_t Page = 0x1000;

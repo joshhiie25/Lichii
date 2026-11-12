@@ -21,6 +21,24 @@ namespace Dynarmic {
 
 using VAddr = std::uint64_t;
 using Vector = std::array<std::uint64_t, 2>;
+#ifdef __cpp_lib_atomic_ref
+using AtomicVAddrRef = std::atomic_ref<VAddr>;
+#else
+// NDK r28's libc++ has no std::atomic_ref; only the operations the arm64 monitor uses.
+struct AtomicVAddrRef {
+    VAddr& ref;
+    VAddr load(std::memory_order mo) const {
+        return __atomic_load_n(&ref, static_cast<int>(mo));
+    }
+    void store(VAddr value, std::memory_order mo) const {
+        __atomic_store_n(&ref, value, static_cast<int>(mo));
+    }
+    bool compare_exchange_strong(VAddr& expected, VAddr desired, std::memory_order mo) const {
+        return __atomic_compare_exchange_n(&ref, &expected, desired, false, static_cast<int>(mo), __ATOMIC_RELAXED);
+    }
+};
+#endif
+
 
 class ExclusiveMonitor {
 public:
@@ -39,7 +57,7 @@ public:
         const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
 
 #ifdef ARCHITECTURE_arm64
-        std::atomic_ref<VAddr>{reservations[processor_id].address}.store(masked_address, std::memory_order_release);
+        AtomicVAddrRef{reservations[processor_id].address}.store(masked_address, std::memory_order_release);
         const T value = op();
         std::memcpy(reservations[processor_id].value.data(), &value, sizeof(T));
 #else

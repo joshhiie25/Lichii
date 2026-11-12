@@ -36,6 +36,9 @@ constexpr VkDeviceSize MAX_ALIGNMENT = 256;
 // - GT 1030 on ^NIX will OOM with 256mib
 #if defined(__FreeBSD__)
 constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
+#elif defined(__ANDROID__)
+// The GPU shares RAM with the guest, and lmkd kills the game over memory.
+constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 64_MiB;
 #else
 // 128 MiB on Windows too: 256 MiB sat mostly unused in device memory on Switch 2 titles.
 constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
@@ -142,6 +145,22 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+
+#ifdef __ANDROID__
+    // A loading burst leaves hundreds of MiB of idle staging buffers that the one-level-per-frame
+    // sweep frees over 64 frames; on a phone that is enough for lmkd to kill the game.
+    // shortcut: fixed 160 MiB threshold, tune if the idle floor (2 buffers per level) changes.
+    if (CachedBytes(MemoryUsage::Upload) + CachedBytes(MemoryUsage::Download) +
+            CachedBytes(MemoryUsage::DeviceLocal) >
+        160_MiB) {
+        for (size_t level = 0; level < NUM_LEVELS; ++level) {
+            ReleaseLevel(upload_cache, level);
+            ReleaseLevel(download_cache, level);
+            ReleaseLevel(device_local_cache, level);
+        }
+        return;
+    }
+#endif
 
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);

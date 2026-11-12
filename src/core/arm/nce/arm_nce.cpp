@@ -4,9 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cinttypes>
 #include <memory>
+#include <optional>
 
+#include "common/cpu_features.h"
 #include "common/signal_chain.h"
 #include "core/arm/nce/arm_nce.h"
 #include "core/arm/nce/interpreter_visitor.h"
@@ -26,6 +29,7 @@ namespace {
 
 struct sigaction g_orig_bus_action;
 struct sigaction g_orig_segv_action;
+struct sigaction g_orig_ill_action;
 
 // Verify assembly offsets.
 using NativeExecutionParameters = Kernel::KThread::NativeExecutionParameters;
@@ -170,8 +174,63 @@ bool ArmNce::HandleGuestAccessFault(GuestContext* guest_ctx, void* raw_info, voi
         return true;
     }
 
+    // The page is unmapped. Emulate the access (a load returns 0, a store is dropped) as Dynarmic
+    // does with cpuopt_ignore_memory_aborts, rather than skipping a load and leaving garbage in
+    // its destination register. A prefetch abort (pc == si_addr) has nothing to emulate.
+    auto& host_ctx = static_cast<ucontext_t*>(raw_context)->uc_mcontext;
+    const bool is_data_access = host_ctx.pc != reinterpret_cast<u64>(info->si_addr);
+    std::optional<u64> next_pc;
+    if (is_data_access) {
+        next_pc = MatchAndExecuteOneInstruction(memory, &host_ctx, GetFloatingPointState(host_ctx));
+    }
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_INFO(Core_ARM, "Unmapped guest access @ {:#x} from pc {:#x}: {}", reinterpret_cast<u64>(info->si_addr),
+                 static_cast<u64>(host_ctx.pc), next_pc ? "emulated" : "skipped");
+    }
+    if (next_pc) {
+        host_ctx.pc = *next_pc;
+        return true;
+    }
+
     // We couldn't handle the access.
     return HandleFailedGuestFault(guest_ctx, raw_info, raw_context);
+}
+
+// Port of Eglantine #741 (SIGILL handler). Unlike #741's default, which halts the guest thread, the
+// instruction is skipped as Dynarmic does, so a game that traps on a recoverable path keeps running.
+bool ArmNce::HandleGuestIllegalInstruction(GuestContext*, void*, void* raw_context) {
+    auto& host_ctx = static_cast<ucontext_t*>(raw_context)->uc_mcontext;
+    // MRS Xt, CNTPCT_EL0 / CNTFRQ_EL0 that the patcher did not rewrite (EL0 cannot read CNTPCT_EL0
+    // on Linux): give the guest its counter, scaled as the patcher's handler does.
+    const u32 instruction = *reinterpret_cast<const u32*>(host_ctx.pc);
+    const bool cntpct = (instruction & 0xFFFFFFE0) == 0xD53BE020;
+    if (cntpct || (instruction & 0xFFFFFFE0) == 0xD53BE000) {
+        u64 value = Common::g_wall_clock.GetGuestCNTFRQ();
+        if (cntpct) {
+            static const auto factor = [] {
+                Common::WallClock clock(false, 1);
+                clock.SetGuestCNTFRQ(Common::g_wall_clock.GetGuestCNTFRQ());
+                return clock.GetGuestCNTFRQFactor();
+            }();
+            u64 ticks;
+            asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+            value = static_cast<u64>((static_cast<unsigned __int128>(ticks) * static_cast<u64>(factor)) >> 64) +
+                    ticks * static_cast<u64>(factor >> 64);
+        }
+        if (const u32 rt = instruction & 31; rt != 31) {
+            host_ctx.regs[rt] = value;
+        }
+        host_ctx.pc += 4;
+        return true;
+    }
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Core_ARM, "Guest undefined instruction {:#010x} at pc {:#x}, skipping",
+                    *reinterpret_cast<const u32*>(host_ctx.pc), static_cast<u64>(host_ctx.pc));
+    }
+    host_ctx.pc += 4;
+    return true;
 }
 
 void ArmNce::HandleHostAlignmentFault(int sig, void* raw_info, void* raw_context) {
@@ -180,6 +239,18 @@ void ArmNce::HandleHostAlignmentFault(int sig, void* raw_info, void* raw_context
 
 void ArmNce::HandleHostAccessFault(int sig, void* raw_info, void* raw_context) {
     return g_orig_segv_action.sa_sigaction(sig, static_cast<siginfo_t*>(raw_info), raw_context);
+}
+
+void ArmNce::HandleHostIllegalInstruction(int sig, void* raw_info, void* raw_context) {
+    if (g_orig_ill_action.sa_flags & SA_SIGINFO) {
+        return g_orig_ill_action.sa_sigaction(sig, static_cast<siginfo_t*>(raw_info), raw_context);
+    }
+    if (g_orig_ill_action.sa_handler == SIG_DFL || g_orig_ill_action.sa_handler == SIG_IGN) {
+        // Restore the original disposition; the instruction faults again on return.
+        Common::SigAction(sig, &g_orig_ill_action, nullptr);
+        return;
+    }
+    g_orig_ill_action.sa_handler(sig);
 }
 
 void ArmNce::LockThread(Kernel::KThread* thread) {
@@ -302,6 +373,7 @@ void ArmNce::Initialize() {
         sigaddset(&signal_mask, BreakFromRunCodeSignal);
         sigaddset(&signal_mask, GuestAlignmentFaultSignal);
         sigaddset(&signal_mask, GuestAccessFaultSignal);
+        sigaddset(&signal_mask, GuestIllegalInstructionSignal);
 
         struct sigaction return_to_run_code_action {};
         return_to_run_code_action.sa_flags = SA_SIGINFO | SA_ONSTACK;
@@ -331,6 +403,14 @@ void ArmNce::Initialize() {
             reinterpret_cast<HandlerType>(&ArmNce::GuestAccessFaultSignalHandler);
         access_fault_action.sa_mask = signal_mask;
         Common::SigAction(GuestAccessFaultSignal, &access_fault_action, &g_orig_segv_action);
+
+        struct sigaction illegal_instruction_action {};
+        illegal_instruction_action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        illegal_instruction_action.sa_sigaction =
+            reinterpret_cast<HandlerType>(&ArmNce::GuestIllegalInstructionSignalHandler);
+        illegal_instruction_action.sa_mask = signal_mask;
+        Common::SigAction(GuestIllegalInstructionSignal, &illegal_instruction_action,
+                          &g_orig_ill_action);
     });
 }
 

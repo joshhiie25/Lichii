@@ -385,6 +385,10 @@ if (CXX_GCC OR CXX_CLANG)
             set(march armv8.2-a+lse+rcpc)
         elseif (${YUZU_BUILD_PRESET} STREQUAL "armv9")
             set(march armv9-a)
+        elseif (${YUZU_BUILD_PRESET} STREQUAL "sd8gen2")
+            # Snapdragon 8 Gen 2 (X3/A715/A710/A510). Stays below armv9-a so no SVE/SVE2 is emitted.
+            set(march armv8.4-a+fp16+dotprod+lse+rcpc)
+            set(mtune cortex-a710)
         endif()
     endif()
 

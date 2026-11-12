@@ -1060,7 +1060,7 @@ std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) co
     return GetTICEntry(tic_index);
 }
 
-bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
+bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key, u64 shader_hash) {
     using namespace VideoCommon::OotNetwork;
     if (!BypassEnabled(program_id)) {
         return false;
@@ -1072,6 +1072,18 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     // The tonemap pass draws before the network every frame; until it has been seen (menus, the
     // first frame) the network runs as usual. Its first passes are skipped only while the output
     // pass is being replaced, so a failed replacement brings the whole network back next frame.
+    // EDEN_NX2_OOT_KEY_TRACE=1: the first 64 distinct native compute keys of the run, in order.
+    static const bool key_trace = std::getenv("EDEN_NX2_OOT_KEY_TRACE") != nullptr;
+    if (key_trace) {
+        static std::mutex trace_mutex;
+        static std::vector<u64> seen;
+        std::scoped_lock trace_lock{trace_mutex};
+        if (seen.size() < 64 && std::find(seen.begin(), seen.end(), native_key) == seen.end()) {
+            seen.push_back(native_key);
+            LOG_INFO(HW_GPU, "Ocarina of Time: native compute key #{} {:#018x} shader {:#018x}",
+                     seen.size(), native_key, shader_hash);
+        }
+    }
     Maxwell3D::Regs::RenderTargetConfig tonemapped;
     {
         std::scoped_lock lock{bypass->mutex};
@@ -1080,7 +1092,8 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (tonemapped.Address() == 0) {
         return false;
     }
-    if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
+    if (native_key == PrepassProgramKey || shader_hash == HeavyShaderHash ||
+        native_key == NetworkProgramKey) {
         return bypass->output_replaced.load(std::memory_order_relaxed);
     }
     if (native_key != OutputProgramKey) {

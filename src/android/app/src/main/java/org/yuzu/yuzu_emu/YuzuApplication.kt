@@ -18,6 +18,7 @@ import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 import android.content.res.Configuration
 import android.os.LocaleList
+import android.system.Os
 import org.yuzu.yuzu_emu.features.settings.model.IntSetting
 import org.yuzu.yuzu_emu.utils.DirectoryInitialization
 import org.yuzu.yuzu_emu.utils.DocumentsTree
@@ -57,9 +58,23 @@ class YuzuApplication : Application() {
         notificationManager.createNotificationChannel(foregroundService)
     }
 
+    // Optional files/nx2_env.txt (KEY=VALUE per line) sets EDEN_NX2_* debug variables before the
+    // native library reads them; absent file means no change.
+    private fun loadDebugEnv() {
+        val file = File(getPublicFilesDir(), "nx2_env.txt")
+        if (!file.isFile) return
+        file.readLines().forEach { line ->
+            val entry = line.trim()
+            val eq = entry.indexOf('=')
+            if (entry.startsWith("#") || eq <= 0) return@forEach
+            Os.setenv(entry.substring(0, eq).trim(), entry.substring(eq + 1).trim(), true)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         application = this
+        loadDebugEnv()
         documentsTree = DocumentsTree()
         DirectoryInitialization.start()
 

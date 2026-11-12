@@ -55,6 +55,13 @@ Patcher::Patcher(std::span<const u8> text) : c(m_patch_instructions), c_pre(m_pa
             BranchToPatch(offset);
             const auto src_reg = mrs.GetSystemReg() == TpidrroEl0 ? oaknut::SystemReg::TPIDRRO_EL0 : oaknut::SystemReg::TPIDR_EL0;
             WriteMrsHandler(offset + sizeof(u32), oaknut::XReg{static_cast<int>(mrs.GetRt())}, src_reg);
+        } else if (mrs.Verify() && mrs.GetRt() != 31 && mrs.GetSystemReg() == CntpctEl0) {
+            // EL0 cannot read CNTPCT_EL0 on Linux; without this, NROs loaded at runtime die with SIGILL.
+            BranchToPatch(offset);
+            WriteCntpctHandler(offset + sizeof(u32), oaknut::XReg{static_cast<int>(mrs.GetRt())});
+        } else if (mrs.Verify() && mrs.GetRt() != 31 && mrs.GetSystemReg() == CntfrqEl0) {
+            BranchToPatch(offset);
+            WriteCntfrqHandler(offset + sizeof(u32), oaknut::XReg{static_cast<int>(mrs.GetRt())});
         } else if (auto msr = MSR{words[i]}; msr.Verify() && msr.GetSystemReg() == TpidrEl0) {
             BranchToPatch(offset);
             WriteMsrHandler(offset + sizeof(u32), oaknut::XReg{static_cast<int>(msr.GetRt())});
@@ -99,6 +106,7 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
         std::span<const u32>{reinterpret_cast<const u32*>(text.data()), text.size() / sizeof(u32)};
 
     // Loop through instructions, patching as needed.
+    u32 svc_count = 0, tpidr_count = 0, cntpct_count = 0, cntfrq_count = 0, msr_count = 0;
     for (u32 i = ModuleCodeIndex; i < static_cast<u32>(text_words.size()); i++) {
         const u32 inst = text_words[i];
 
@@ -121,6 +129,7 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
 
         // SVC
         if (auto svc = SVC{inst}; svc.Verify()) {
+            ++svc_count;
             bool pre_buffer = false;
             auto ret = AddRelocations(pre_buffer);
             if (pre_buffer) {
@@ -138,6 +147,7 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
             const auto src_reg = mrs.GetSystemReg() == TpidrroEl0 ? oaknut::SystemReg::TPIDRRO_EL0
                                                                   : oaknut::SystemReg::TPIDR_EL0;
             const auto dest_reg = oaknut::XReg{static_cast<int>(mrs.GetRt())};
+            ++tpidr_count;
             bool pre_buffer = false;
             auto ret = AddRelocations(pre_buffer);
             if (pre_buffer) {
@@ -150,6 +160,7 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
 
         // MRS Xn, CNTPCT_EL0
         if (auto mrs = MRS{inst}; mrs.Verify() && mrs.GetSystemReg() == CntpctEl0) {
+            ++cntpct_count;
             bool pre_buffer = false;
             auto ret = AddRelocations(pre_buffer);
             if (pre_buffer) {
@@ -162,6 +173,7 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
 
         // MRS Xn, CNTFRQ_EL0
         if (auto mrs = MRS{inst}; mrs.Verify() && mrs.GetSystemReg() == CntfrqEl0) {
+            ++cntfrq_count;
             bool pre_buffer = false;
             auto ret = AddRelocations(pre_buffer);
             if (pre_buffer) {
@@ -174,6 +186,7 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
 
         // MSR TPIDR_EL0, Xn
         if (auto msr = MSR{inst}; msr.Verify() && msr.GetSystemReg() == TpidrEl0) {
+            ++msr_count;
             bool pre_buffer = false;
             auto ret = AddRelocations(pre_buffer);
              if (pre_buffer) {
@@ -188,6 +201,10 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
             curr_patch->m_exclusives.push_back(i);
         }
     }
+
+    LOG_INFO(Core_ARM,
+             "NCE patched module: text offset {:#x} size {:#x}: svc {} mrs_tpidr {} cntpct {} cntfrq {} msr {}",
+             code.offset, code.size, svc_count, tpidr_count, cntpct_count, cntfrq_count, msr_count);
 
     // Determine patching mode for the final relocation step
     total_program_size += image_size;

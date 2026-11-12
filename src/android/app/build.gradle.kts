@@ -139,6 +139,8 @@ android {
                 applicationIdSuffix = ".nightly"
                 manifestPlaceholders += mapOf("appNameSuffix" to " Nightly")
             } else {
+                // Installs next to an existing Eden instead of replacing it.
+                applicationIdSuffix = ".lichii"
                 manifestPlaceholders += mapOf("appNameSuffix" to "")
             }
 
@@ -190,8 +192,8 @@ android {
             isDefault = true
             minSdk = 33
 
-            manifestPlaceholders += mapOf("appNameBase" to "Eden")
-            resValue("string", "app_name_suffixed", "Eden")
+            manifestPlaceholders += mapOf("appNameBase" to "Lichii")
+            resValue("string", "app_name_suffixed", "Lichii")
 
             ndk {
                 abiFilters += listOf("arm64-v8a")
@@ -270,7 +272,7 @@ android {
 
         // apply nightly suffix I/A
         resValue("string", "app_name_suffixed", "$currentName$suffix")
-        resValue("string", "app_name", "Eden$suffix")
+        resValue("string", "app_name", "Lichii$suffix")
     }
 
     sourceSets {

@@ -26,6 +26,9 @@ constexpr u64 ProgramId = 0x0400486024DEC000ULL;
 constexpr u64 PrepassProgramKey = 0x8475d671e6967428ULL;
 constexpr u64 NetworkProgramKey = 0x42593194bb0b2b32ULL;
 constexpr u64 OutputProgramKey = 0xda6df3e54c716df2ULL;
+/// Shader hash (ShaderInfo::unique_hash, not a native key) of the heavy dispatch between the
+/// prepass and the network; its result goes unused once they are skipped.
+constexpr u64 HeavyShaderHash = 0xd9ee412f00ce399aULL;
 
 /// Constant buffer 0 offset of the output pass's texture handle for the B10G11R11 image it writes
 /// (the scene image the rest of the frame uses).

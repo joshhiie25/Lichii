@@ -226,9 +226,19 @@ Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u
                  memory.Read32Acquire(p.buffer + WriteOffset, write) && read < slots &&
                  write < slots,
              ResultInvalidAddressInfo);
+    LOG_INFO(Service_Audio, "sysmix stream {} opening host stream (input={})", p.id, p.input_stream);
+#ifdef __ANDROID__
+    // shortcut: no microphone on Android. Opening SDL's recording device hangs the audio service
+    // thread there (no RECORD_AUDIO permission); wire the permission and capture if a game needs it.
+    p.host = p.input_stream ? nullptr
+                            : p.sink.AcquireSinkStream(p.system, channels,
+                                                       "sysmix-" + std::to_string(p.id),
+                                                       AudioCore::Sink::StreamType::Sysmix);
+#else
     p.host = p.sink.AcquireSinkStream(p.system, channels, "sysmix-" + std::to_string(p.id),
                                       p.input_stream ? AudioCore::Sink::StreamType::In
                                                      : AudioCore::Sink::StreamType::Sysmix);
+#endif
     if (p.input_stream && (!p.host || !p.host->IsReady())) {
         p.UseSilentInput(channels);
     }

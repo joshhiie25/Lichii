@@ -522,6 +522,9 @@ public:
         return aspect_mask;
     }
 
+    /// Records a clear of the whole image to zero bytes. False when it can't be cleared.
+    bool ClearToZero();
+
     [[nodiscard]] VkImageUsageFlags UsageFlags() const noexcept {
         return (this->*current_image).UsageFlags();
     }

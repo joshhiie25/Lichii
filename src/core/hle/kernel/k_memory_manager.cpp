@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -47,9 +48,23 @@ KMemoryManager::KMemoryManager(Core::System& system)
           KLightLock{system.Kernel()},
       } {}
 
+namespace {
+std::atomic<Common::HostMemory*> g_release_memory{};
+} // namespace
+
+void ReleaseFreedPages(KPhysicalAddress addr, size_t num_pages) {
+    if (Common::HostMemory* const host = g_release_memory.load(std::memory_order_acquire)) {
+        host->ReleaseBackingRegion(GetInteger(addr) - Core::DramMemoryMap::Base,
+                                   num_pages * PageSize);
+    }
+}
+
 void KMemoryManager::Initialize(KVirtualAddress management_region, size_t management_region_size) {
     // Memory a previous kernel handed out may still hold its data.
     m_system.DeviceMemory().buffer.ForgetContents();
+#ifdef __ANDROID__
+    g_release_memory.store(&m_system.DeviceMemory().buffer, std::memory_order_release);
+#endif
 
     // Clear the management region to zero.
     const KVirtualAddress management_region_end = management_region + management_region_size;

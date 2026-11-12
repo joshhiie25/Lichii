@@ -58,6 +58,15 @@ public:
     /// last full clear) is skipped: clearing it only made the host give every page real memory.
     void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value);
 
+    /// Memory the guest freed: the whole granules in the range that may hold data go back to the
+    /// OS now (the next allocation would only clear them), so freed loading buffers stop counting
+    /// against the device. Must run before the pages can be handed out again.
+    void ReleaseBackingRegion(size_t physical_offset, size_t length);
+
+    /// Whether nothing was ever written to this part of the backing view (Linux): it reads as
+    /// zeros, and reading it would make the host give it memory. False when unknown.
+    [[nodiscard]] bool IsUntouched(const u8* backing_pointer, size_t length) const;
+
     /// Memory written once and read again rarely: its pages leave the working set (backing and,
     /// when given, its view at virtual_offset), so the OS compresses or pages them out first when
     /// it needs RAM. The contents stay; using the pages brings them back.

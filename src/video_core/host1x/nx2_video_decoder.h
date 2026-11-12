@@ -41,7 +41,9 @@ bool IsH264Stream(std::span<const u8> data);
 class Nx2VideoDecoder {
 public:
     /// mime: the codec name nn::codec sends with Configure ("video/vp9", "video/vp8", ...).
-    explicit Nx2VideoDecoder(std::string_view mime);
+    /// width, height: the size Configure announced (0 if unknown); only the Android AV1 decoder
+    /// needs them.
+    explicit Nx2VideoDecoder(std::string_view mime, u32 width = 0, u32 height = 0);
     ~Nx2VideoDecoder();
 
     bool IsOpen() const;
