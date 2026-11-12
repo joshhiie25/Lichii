@@ -834,8 +834,14 @@ public:
     }
 
     void PageoutLoop() {
-        constexpr u64 low_free_kib = 1536ULL * 1024;
-        constexpr size_t step = 64ULL << 20;
+        // EDEN_NX2_PAGEOUT_FREE_MIB / EDEN_NX2_PAGEOUT_STEP_MIB: experiment knobs for the trigger
+        // and for the budget of each 100 ms round.
+        const auto knob = [](const char* name, u64 fallback_mib) {
+            const char* value = std::getenv(name);
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : fallback_mib;
+        };
+        const u64 low_free_kib = knob("EDEN_NX2_PAGEOUT_FREE_MIB", 1536) * 1024;
+        const size_t step = static_cast<size_t>(knob("EDEN_NX2_PAGEOUT_STEP_MIB", 64)) << 20;
         // EDEN_NX2_PAGEOUT=0 leaves guest pages alone, for A/B runs.
         static const bool pageout = [] {
             const char* value = std::getenv("EDEN_NX2_PAGEOUT");

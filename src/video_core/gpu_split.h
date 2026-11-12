@@ -84,6 +84,9 @@ inline AcquireStats g_acquire_stats;
 inline bool g_acquire_counting{};
 /// EDEN_NX2_ACQUIRE_VERIFY=1: acquires decided without a drain drain anyway and compare.
 inline bool g_acquire_verify{};
+/// Equal and mask acquires skip the drain like greater-or-equal; EDEN_NX2_ACQUIRE_ANY=0 restores
+/// the drain.
+inline bool g_acquire_any{};
 
 inline void Count(std::atomic<u64>& counter, u64 amount = 1) {
     if (g_acquire_counting) {

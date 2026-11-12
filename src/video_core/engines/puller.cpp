@@ -117,7 +117,7 @@ enum class AcquireCheck {
 AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
     auto& split = VideoCommon::GpuSplit::Get();
     auto& stats = VideoCommon::g_acquire_stats;
-    if (!acquire.WaitsToReach()) {
+    if (!acquire.WaitsToReach() && !VideoCommon::g_acquire_any) {
         VideoCommon::Count(stats.drain_operation);
         return AcquireCheck::Drain;
     }
